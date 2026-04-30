@@ -108,6 +108,14 @@ jobs:
                   restore-keys: bootstrap-${{ matrix.runner }}-
 
             # ── 4. Bootstrap (only when cache miss) ────────────────────────────────
+            # ubuntu-22.04 ships Python 3.10; Matter SDK requires 3.11+ for mobly
+            # and other dependencies. Install 3.12 so Pigweed venv uses it.
+            - name: Set up Python 3.12
+              if: steps.cache-bootstrap.outputs.cache-hit != 'true'
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
             - name: Bootstrap Matter environment
               if: steps.cache-bootstrap.outputs.cache-hit != 'true'
               env:
