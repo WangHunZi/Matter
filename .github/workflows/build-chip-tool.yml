@@ -87,7 +87,15 @@ jobs:
                   attempt_limit: 3
                   attempt_delay: 2000
 
-            # ── 3. Restore bootstrap cache ─────────────────────────────────────────
+            # ── 3. Install Linux system dependencies ──────────────────────────────
+            - name: Install Linux system dependencies
+              if: matrix.platform == 'linux'
+              run: |
+                  sudo apt-get update -y
+                  sudo apt-get install -y --no-install-recommends \
+                    libevent-dev
+
+            # ── 4. Restore bootstrap cache ──────────────────────────────────────────
             # Cache key includes: runner identity + hash of all setup files + pigweed config
             - name: Restore bootstrap cache
               id: cache-bootstrap
@@ -107,7 +115,7 @@ jobs:
                       }}
                   restore-keys: bootstrap-${{ matrix.runner }}-
 
-            # ── 4. Bootstrap (only when cache miss) ────────────────────────────────
+            # ── 5. Bootstrap (only when cache miss) ────────────────────────────────
             # ubuntu-22.04 ships Python 3.10; Matter SDK requires 3.11+ for mobly
             # and other dependencies. Install 3.12 so Pigweed venv uses it.
             - name: Set up Python 3.12
@@ -144,7 +152,7 @@ jobs:
                         )
                       }}
 
-            # ── 5. Upload bootstrap logs (always, for debugging) ──────────────────
+            # ── 6. Upload bootstrap logs (always, for debugging) ──────────────────
             - name: Upload bootstrap logs
               uses: actions/upload-artifact@v4
               if: always() && steps.cache-bootstrap.outputs.cache-hit != 'true'
@@ -156,7 +164,7 @@ jobs:
                   if-no-files-found: ignore
                   retention-days: 7
 
-            # ── 6. Patch config for test mode ──────────────────────────────────────
+            # ── 7. Patch config for test mode ──────────────────────────────────────
             - name: Enable CHIP_CONFIG_SECURITY_TEST_MODE
               if: matrix.test_mode == true
               shell: bash
@@ -169,7 +177,7 @@ jobs:
                   echo "=== Patched config ==="
                   grep CHIP_CONFIG_SECURITY_TEST_MODE "$config"
 
-            # ── 7. Build ────────────────────────────────────────────────────────────
+            # ── 8. Build ────────────────────────────────────────────────────────────
             - name: Build chip-tool
               shell: bash
               run: |
@@ -179,7 +187,7 @@ jobs:
                       out/chip-tool \
                       treat_warnings_as_errors=false"
 
-            # ── 8. Verify & collect artifact ───────────────────────────────────────
+            # ── 9. Verify & collect artifact ───────────────────────────────────────
             - name: Show binary info
               shell: bash
               run: |
