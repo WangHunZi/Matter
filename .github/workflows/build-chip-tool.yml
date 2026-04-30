@@ -1,0 +1,242 @@
+# Build chip-tool for multiple platforms with optional CHIP_CONFIG_SECURITY_TEST_MODE.
+#
+# Variants produced:
+#   linux-x86_64-release      linux-x86_64-test-mode
+#   linux-arm64-release       linux-arm64-test-mode   (Raspberry Pi 5B compatible)
+#   macos-arm64-release       macos-arm64-test-mode   (Apple Silicon M1/M2/M3/M4)
+#
+# Test-mode binaries have CHIP_CONFIG_SECURITY_TEST_MODE=1 and treat_warnings_as_errors=false.
+# They interoperate with devices built with the same flag (e.g. for packet capture / learning).
+
+name: Build chip-tool
+
+on:
+    push:
+        branches: [ "main", "master" ]
+        tags: [ "v*" ]
+    pull_request:
+    workflow_dispatch:
+
+        # Cancel in-progress runs on new push to the same ref
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build:
+        name: ${{ matrix.name }}
+        runs-on: ${{ matrix.runner }}
+
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # ── Linux x86_64 ────────────────────────────────────────────────
+                    - name: linux-x86_64-release
+                      runner: ubuntu-22.04
+                      platform: linux
+                      test_mode: false
+
+                    - name: linux-x86_64-test-mode
+                      runner: ubuntu-22.04
+                      platform: linux
+                      test_mode: true
+
+                    # ── Linux ARM64 (Raspberry Pi 5B) ────────────────────────────────
+                    - name: linux-arm64-release
+                      runner: ubuntu-22.04-arm
+                      platform: linux
+                      test_mode: false
+
+                    - name: linux-arm64-test-mode
+                      runner: ubuntu-22.04-arm
+                      platform: linux
+                      test_mode: true
+
+                    # ── macOS Apple Silicon (M1/M2/M3/M4) ────────────────────────
+                    - name: macos-arm64-release
+                      runner: macos-latest
+                      platform: darwin
+                      test_mode: false
+
+                    - name: macos-arm64-test-mode
+                      runner: macos-latest
+                      platform: darwin
+                      test_mode: true
+
+        steps:
+            # ── 1. Checkout ────────────────────────────────────────────────────────
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 1
+
+            # Allow scripts/checkout_submodules.py to work inside the container
+            - name: Mark workspace as safe for git
+              shell: bash
+              run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+            # ── 2. Checkout platform-specific submodules (shallow) ────────────────
+            - name: Checkout submodules
+              uses: Wandalen/wretry.action@v1.4.10
+              with:
+                  command: >-
+                      scripts/checkout_submodules.py
+                      --allow-changing-global-git-config --shallow --platform
+                      ${{ matrix.platform }}
+                  attempt_limit: 3
+                  attempt_delay: 2000
+
+            # ── 3. Restore bootstrap cache ─────────────────────────────────────────
+            # Cache key includes: runner identity + hash of all setup files + pigweed config
+            - name: Restore bootstrap cache
+              id: cache-bootstrap
+              uses: actions/cache/restore@v4
+              with:
+                  path: |
+                      .environment
+                      build_overrides/pigweed_environment.gni
+                  key: >-
+                      bootstrap-${{ matrix.runner }}-${{
+                        hashFiles(
+                          'scripts/setup/environment.json',
+                          'scripts/setup/constraints.txt',
+                          'scripts/setup/requirements.build.txt',
+                          'scripts/tests/requirements.txt'
+                        )
+                      }}
+                  restore-keys: bootstrap-${{ matrix.runner }}-
+
+            # ── 4. Bootstrap (only when cache miss) ────────────────────────────────
+            - name: Bootstrap Matter environment
+              if: steps.cache-bootstrap.outputs.cache-hit != 'true'
+              env:
+                  PW_NO_CIPD_CACHE_DIR: 1
+                  PW_ENVSETUP_NO_BANNER: 1
+              shell: bash
+              run: source scripts/bootstrap.sh -p all,${{ matrix.platform }}
+
+            # Save cache only on non-PR builds to avoid key collisions
+            - name: Save bootstrap cache
+              if: >-
+                  steps.cache-bootstrap.outputs.cache-hit != 'true' &&
+                  github.event_name != 'pull_request'
+              uses: actions/cache/save@v4
+              with:
+                  path: |
+                      .environment
+                      build_overrides/pigweed_environment.gni
+                  key: >-
+                      bootstrap-${{ matrix.runner }}-${{
+                        hashFiles(
+                          'scripts/setup/environment.json',
+                          'scripts/setup/constraints.txt',
+                          'scripts/setup/requirements.build.txt',
+                          'scripts/tests/requirements.txt'
+                        )
+                      }}
+
+            # ── 5. Upload bootstrap logs (always, for debugging) ──────────────────
+            - name: Upload bootstrap logs
+              uses: actions/upload-artifact@v4
+              if: always() && steps.cache-bootstrap.outputs.cache-hit != 'true'
+              with:
+                  name: bootstrap-logs-${{ matrix.name }}
+                  path: |
+                      .environment/gn_out/.ninja_log
+                      .environment/pigweed-venv/*.log
+                  if-no-files-found: ignore
+                  retention-days: 7
+
+            # ── 6. Patch config for test mode ──────────────────────────────────────
+            - name: Enable CHIP_CONFIG_SECURITY_TEST_MODE
+              if: matrix.test_mode == true
+              shell: bash
+              run: |
+                  config=examples/chip-tool/include/CHIPProjectAppConfig.h
+                  # Works on both macOS (BSD sed) and Linux (GNU sed)
+                  sed -i.bak \
+                    's/^#define CHIP_CONFIG_SECURITY_TEST_MODE 0$/#define CHIP_CONFIG_SECURITY_TEST_MODE 1/' \
+                    "$config"
+                  echo "=== Patched config ==="
+                  grep CHIP_CONFIG_SECURITY_TEST_MODE "$config"
+
+            # ── 7. Build ────────────────────────────────────────────────────────────
+            - name: Build chip-tool
+              shell: bash
+              run: |
+                  scripts/run_in_build_env.sh \
+                    "scripts/examples/gn_build_example.sh \
+                      examples/chip-tool \
+                      out/chip-tool \
+                      treat_warnings_as_errors=false"
+
+            # ── 8. Verify & collect artifact ───────────────────────────────────────
+            - name: Show binary info
+              shell: bash
+              run: |
+                  file out/chip-tool/chip-tool
+                  ls -lh out/chip-tool/chip-tool
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: chip-tool-${{ matrix.name }}
+                  path: out/chip-tool/chip-tool
+                  if-no-files-found: error
+                  retention-days: 90
+
+    # ── Release job: runs only when a tag is pushed ──────────────────────────────
+    release:
+        name: Create GitHub Release
+        needs: build
+        runs-on: ubuntu-22.04
+        if: startsWith(github.ref, 'refs/tags/')
+        permissions:
+            contents: write
+
+        steps:
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: artifacts/
+                  # Skip bootstrap log artifacts
+                  pattern: chip-tool-*
+                  merge-multiple: false
+
+            - name: Prepare release assets
+              shell: bash
+              run: |
+                  mkdir -p release/
+                  find artifacts/ -name 'chip-tool' | while read -r f; do
+                    # artifacts/chip-tool-linux-x86_64-release/chip-tool
+                    #   -> release/chip-tool-linux-x86_64-release
+                    variant="$(basename "$(dirname "$f")")"
+                    target="release/${variant}"
+                    cp "$f" "$target"
+                    chmod +x "$target"
+                    echo "Prepared: $target  ($(file "$target" | cut -d: -f2))"
+                  done
+                  ls -lh release/
+
+            - name: Create Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  files: release/chip-tool-*
+                  generate_release_notes: true
+                  draft: false
+                  body: |
+                      ## chip-tool builds
+
+                      | Binary | Description |
+                      |--------|-------------|
+                      | `chip-tool-linux-x86_64-release` | Linux x86_64, standard mode |
+                      | `chip-tool-linux-x86_64-test-mode` | Linux x86_64, `CHIP_CONFIG_SECURITY_TEST_MODE=1` |
+                      | `chip-tool-linux-arm64-release` | Linux ARM64 (Raspberry Pi 5B), standard mode |
+                      | `chip-tool-linux-arm64-test-mode` | Linux ARM64 (Raspberry Pi 5B), `CHIP_CONFIG_SECURITY_TEST_MODE=1` |
+                      | `chip-tool-macos-arm64-release` | macOS Apple Silicon (M1/M2/M3/M4), standard mode |
+                      | `chip-tool-macos-arm64-test-mode` | macOS Apple Silicon (M1/M2/M3/M4), `CHIP_CONFIG_SECURITY_TEST_MODE=1` |
+
+                      > ⚠️ **test-mode** binaries bypass key negotiation and use a fixed test key.
+                      > They can **only** communicate with devices built with the same flag.
+                      > Never use in production.
